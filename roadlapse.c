@@ -83,10 +83,12 @@ void build_adaptive_speedup_filter(char *filter_desc, size_t filter_desc_size,
     int target_fps = get_optimal_framerate(input_fps);
     printf("DEBUG: Input framerate: %.2f fps, Target framerate: %d fps\n", input_fps, target_fps);
 
-    // Always use the same filter for 4x speedup
+    // Use tmix for efficient 4x speedup with motion blur
+    // tmix=frames=4 averages 4 frames and advances by 4
+    // weights='1 1 1 1' gives equal weighting to all frames
     snprintf(filter_desc, filter_desc_size,
-            "tblend=average,framestep=2,tblend=average,framestep=2,setpts=PTS/4");
-    printf("DEBUG: Using 4x timestamp speedup\n");
+            "tmix=frames=4:weights='1 1 1 1',setpts=PTS/4");
+    printf("DEBUG: Using tmix for 4x speedup with motion blur\n");
 
     printf("DEBUG: Filter description: %s\n", filter_desc);
 }
@@ -1137,20 +1139,24 @@ int diagnose_video_file(const char *input_file) {
     }
 
     // Check if required filters are available
-    const AVFilter *tblend = avfilter_get_by_name("tblend");
-    const AVFilter *framestep = avfilter_get_by_name("framestep");
+    const AVFilter *tmix = avfilter_get_by_name("tmix");  // Add this
     const AVFilter *setpts = avfilter_get_by_name("setpts");
     const AVFilter *fps_filter = avfilter_get_by_name("fps");
     const AVFilter *vidstabdetect = avfilter_get_by_name("vidstabdetect");
     const AVFilter *vidstabtransform = avfilter_get_by_name("vidstabtransform");
 
     printf("\n=== Filter Availability ===\n");
-    printf("tblend: %s\n", tblend ? "✓ Available" : "❌ Missing");
-    printf("framestep: %s\n", framestep ? "✓ Available" : "❌ Missing");
+    printf("tmix: %s\n", tmix ? "✓ Available" : "❌ Missing (REQUIRED)");
     printf("setpts: %s\n", setpts ? "✓ Available" : "❌ Missing");
     printf("fps: %s\n", fps_filter ? "✓ Available" : "❌ Missing");
     printf("vidstabdetect: %s\n", vidstabdetect ? "✓ Available" : "❌ Missing");
     printf("vidstabtransform: %s\n", vidstabtransform ? "✓ Available" : "❌ Missing");
+
+    if (!tmix) {
+        printf("\n⚠️  ERROR: tmix filter not available!\n");
+        printf("   This is required for efficient motion blur.\n");
+        printf("   Please update FFmpeg to a recent version.\n");
+    }
 
     if (!vidstabdetect || !vidstabtransform) {
         printf("\n⚠️  WARNING: Video stabilization filters not available!\n");
