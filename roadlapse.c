@@ -524,7 +524,7 @@ int create_speedup_version(char **input_files, int num_files, const char *output
 
                     // Debug only first few frames to avoid spam
                     if (output_frame_number < 3) {
-                        printf("DEBUG: Frame %ld: PTS=%ld, time_base=%d/%d, increment=%ld\n",
+                        printf("DEBUG: Frame %ld: PTS=%lld, time_base=%d/%d, increment=%lld\n",
                                output_frame_number, filt_frame->pts,
                                out_stream->time_base.num, out_stream->time_base.den, pts_increment);
                     }
@@ -687,8 +687,8 @@ int detect_stabilization(const char *speedup_file, const char *trf_file,
     }
 
     // Process frames for detection (no encoding needed)
-    long frame_count = 0;
-    long total_frames = ctx.input_fmt_ctx->streams[ctx.video_stream_index]->nb_frames;
+    int64_t frame_count = 0;
+    int64_t total_frames = ctx.input_fmt_ctx->streams[ctx.video_stream_index]->nb_frames;
     if (total_frames <= 0) total_frames = 10000; // Estimate if unknown
 
     while (av_read_frame(ctx.input_fmt_ctx, packet) >= 0) {
@@ -782,9 +782,9 @@ int apply_stabilization(const char *speedup_file, const char *output_file, const
     }
 
     // Process frames for stabilization
-    long frame_count = 0;
-    long output_frame_number = 0;  // Track output frame number for timestamp calculation
-    long total_frames = ctx.input_fmt_ctx->streams[ctx.video_stream_index]->nb_frames;
+    int64_t frame_count = 0;
+    int64_t output_frame_number = 0;  // Track output frame number for timestamp calculation
+    int64_t total_frames = ctx.input_fmt_ctx->streams[ctx.video_stream_index]->nb_frames;
     if (total_frames <= 0) total_frames = 10000; // Estimate if unknown
 
     while (av_read_frame(ctx.input_fmt_ctx, packet) >= 0) {
@@ -1116,7 +1116,7 @@ int diagnose_video_file(const char *input_file) {
     if (video_stream->duration != AV_NOPTS_VALUE) {
         double duration = (double)video_stream->duration * av_q2d(video_stream->time_base);
         printf("Duration: %.2f seconds\n", duration);
-        printf("Estimated frames: %ld\n", video_stream->nb_frames);
+        printf("Estimated frames: %lld\n", video_stream->nb_frames);
     }
 
     // Check if decoder is available
