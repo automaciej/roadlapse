@@ -76,21 +76,73 @@ int get_optimal_framerate(double input_fps) {
     }
 }
 
-// Build adaptive speedup filter based on input framerate
-void build_adaptive_speedup_filter(char *filter_desc, size_t filter_desc_size,
-                                   double input_fps) {
+// Build parallel stream speedup filter (like our shell script)
+void build_parallel_speedup_filter(char *filter_desc, size_t filter_desc_size,
+                                   double input_fps, int speedup_degree) {
 
     int target_fps = get_optimal_framerate(input_fps);
+    int factor = 1 << speedup_degree;  // 2^speedup_degree
+
     printf("DEBUG: Input framerate: %.2f fps, Target framerate: %d fps\n", input_fps, target_fps);
+    printf("DEBUG: Speedup degree: %d, Factor: %d\n", speedup_degree, factor);
 
-    // Use tmix for efficient 4x speedup with motion blur
-    // tmix=frames=4 averages 4 frames and advances by 4
-    // weights='1 1 1 1' gives equal weighting to all frames
-    snprintf(filter_desc, filter_desc_size,
-            "tmix=frames=4:weights='1 1 1 1',setpts=PTS/4");
-    printf("DEBUG: Using tmix for 4x speedup with motion blur\n");
+    // For small factors, try the complex approach. For testing, let's try simple tmix first
+    if (factor <= 8) {
+        // Use the parallel stream approach
+        // Check if we have enough space for the filter description
+        size_t estimated_size = factor * 100 + 1000;
+        if (estimated_size > filter_desc_size) {
+            fprintf(stderr, "ERROR: Filter description buffer too small. Need ~%zu bytes, have %zu\n",
+                    estimated_size, filter_desc_size);
+            snprintf(filter_desc, filter_desc_size, "scale=iw:ih");  // Fallback to passthrough
+            return;
+        }
 
-    printf("DEBUG: Filter description: %s\n", filter_desc);
+        // Start building the filter description
+        int pos = 0;
+
+        // Split into parallel streams: [in]split=N[s0][s1]...[sN-1];
+        pos += snprintf(filter_desc + pos, filter_desc_size - pos, "[in]split=%d", factor);
+
+        for (int i = 0; i < factor; i++) {
+            pos += snprintf(filter_desc + pos, filter_desc_size - pos, "[s%d]", i);
+        }
+        pos += snprintf(filter_desc + pos, filter_desc_size - pos, ";");
+
+        // Generate select filters for each stream: [s0]select='not(mod(n-0,factor))',setpts=N/TB[stream0];
+        for (int i = 0; i < factor; i++) {
+            pos += snprintf(filter_desc + pos, filter_desc_size - pos,
+                           "[s%d]select='not(mod(n-%d,%d))',setpts=N/TB[stream%d];",
+                           i, i, factor, i);
+
+            // Safety check to prevent buffer overflow
+            if (pos >= filter_desc_size - 200) {
+                fprintf(stderr, "ERROR: Filter description buffer overflow during select generation\n");
+                snprintf(filter_desc, filter_desc_size, "scale=iw:ih");  // Fallback
+                return;
+            }
+        }
+
+        // Mix all streams and connect to output sink
+        for (int i = 0; i < factor; i++) {
+            pos += snprintf(filter_desc + pos, filter_desc_size - pos, "[stream%d]", i);
+        }
+
+        // Label the final output as "out" to connect to the sink
+        pos += snprintf(filter_desc + pos, filter_desc_size - pos, "mix=inputs=%d[out]", factor);
+
+        printf("DEBUG: Using parallel stream mixing for %dx speedup with motion blur\n", factor);
+        printf("DEBUG: Filter description length: %d characters\n", pos);
+
+        // Print the actual filter to debug syntax issues
+        printf("DEBUG: Complete filter: %s\n", filter_desc);
+    } else {
+        // For large factors, fall back to simpler tmix approach for now
+        printf("DEBUG: Factor %d too large for parallel streams, using simple tmix\n", factor);
+        snprintf(filter_desc, filter_desc_size,
+                "tmix=frames=%d,setpts=PTS/%d", factor, factor);
+        printf("DEBUG: Using simple tmix fallback: %s\n", filter_desc);
+    }
 }
 
 int setup_decoder(RoadlapseContext *ctx, const char *input_file) {
@@ -445,16 +497,17 @@ int setup_concat_decoder(RoadlapseContext *ctx, char **input_files, int num_file
     return 0;
 }
 
-// Step 1: Create 4x speedup version with adaptive filtering (supports multiple inputs)
+// Step 1: Create speedup version with parallel stream processing (supports multiple inputs)
 int create_speedup_version(char **input_files, int num_files, const char *output_file,
-                          ProgressCallback progress_cb, void *user_data) {
+                          int speedup_degree, ProgressCallback progress_cb, void *user_data) {
     RoadlapseContext ctx = {0};
     AVFrame *frame = av_frame_alloc();
     AVFrame *filt_frame = av_frame_alloc();
     AVPacket *packet = av_packet_alloc();
     int ret = 0;
+    int factor = 1 << speedup_degree;  // 2^speedup_degree
 
-    printf("=== Step 1: Creating 4x speedup ===\n");
+    printf("=== Step 1: Creating %dx speedup ===\n", factor);
 
     // Setup decoder (concat for multiple files, regular for single file)
     if (num_files > 1) {
@@ -476,9 +529,9 @@ int create_speedup_version(char **input_files, int num_files, const char *output
         goto cleanup;
     }
 
-    // Build adaptive speedup filter based on input
-    char speedup_filter[512];
-    build_adaptive_speedup_filter(speedup_filter, sizeof(speedup_filter), input_fps);
+    // Build parallel stream speedup filter based on input
+    char speedup_filter[50000];  // Large buffer for complex filter graphs
+    build_parallel_speedup_filter(speedup_filter, sizeof(speedup_filter), input_fps, speedup_degree);
 
     if ((ret = setup_filter_graph(&ctx, speedup_filter)) < 0) {
         goto cleanup;
@@ -603,8 +656,8 @@ int create_speedup_version(char **input_files, int num_files, const char *output
         ret = 0;  // Don't fail the whole process for trailer issues
     }
 
-    printf("✓ Step 1 complete: 4x effective speedup saved to %s\n", output_file);
-    printf("  Strategy: %.2f fps input → %d fps output using 4x timestamp adjustment\n",
+    printf("✓ Step 1 complete: %dx effective speedup saved to %s\n", factor, output_file);
+    printf("  Strategy: %.2f fps input → %d fps output using parallel stream mixing\n",
            input_fps, target_fps);
 
     // Debug: Check what framerate we actually created
@@ -942,10 +995,11 @@ cleanup:
 }
 
 int process_roadlapse(char **input_files, int num_files, const char *output_file,
-                      ProgressCallback progress_cb, void *user_data) {
+                      int speedup_degree, ProgressCallback progress_cb, void *user_data) {
     char trf_temp[] = "/tmp/roadlapse_XXXXXX.trf";
     char shaky_temp[] = "/tmp/roadlapse_shaky_XXXXXX.mp4";
     int ret = 0;
+    int factor = 1 << speedup_degree;  // 2^speedup_degree
 
     // Create temporary files
     int fd = mkstemps(trf_temp, 4);
@@ -972,6 +1026,8 @@ int process_roadlapse(char **input_files, int num_files, const char *output_file
         }
     }
 
+    printf("Speedup degree: %d (factor: %dx)\n", speedup_degree, factor);
+
     // Detect optimal framerate from first input
     AVFormatContext *probe_ctx = NULL;
     if (avformat_open_input(&probe_ctx, input_files[0], NULL, NULL) == 0) {
@@ -990,13 +1046,13 @@ int process_roadlapse(char **input_files, int num_files, const char *output_file
     }
 
     printf("Temporary files:\n");
-    printf("  Shaky (4x speedup): %s\n", shaky_temp);
+    printf("  Shaky (%dx speedup): %s\n", factor, shaky_temp);
     printf("  Stabilization data: %s\n", trf_temp);
     printf("\n");
 
-    // Step 1: Create 4x speedup version (with concatenation if needed)
+    // Step 1: Create speedup version with parallel stream processing
     printf("DEBUG: About to start Step 1\n");
-    if ((ret = create_speedup_version(input_files, num_files, shaky_temp, progress_cb, user_data)) < 0) {
+    if ((ret = create_speedup_version(input_files, num_files, shaky_temp, speedup_degree, progress_cb, user_data)) < 0) {
         fprintf(stderr, "Step 1 failed: creating speedup version (error code: %d)\n", ret);
         ret = -1;  // Standardize error code for step 1
         goto cleanup;
@@ -1139,22 +1195,26 @@ int diagnose_video_file(const char *input_file) {
     }
 
     // Check if required filters are available
-    const AVFilter *tmix = avfilter_get_by_name("tmix");  // Add this
+    const AVFilter *split = avfilter_get_by_name("split");
+    const AVFilter *select = avfilter_get_by_name("select");
+    const AVFilter *mix = avfilter_get_by_name("mix");
     const AVFilter *setpts = avfilter_get_by_name("setpts");
     const AVFilter *fps_filter = avfilter_get_by_name("fps");
     const AVFilter *vidstabdetect = avfilter_get_by_name("vidstabdetect");
     const AVFilter *vidstabtransform = avfilter_get_by_name("vidstabtransform");
 
     printf("\n=== Filter Availability ===\n");
-    printf("tmix: %s\n", tmix ? "✓ Available" : "❌ Missing (REQUIRED)");
+    printf("split: %s\n", split ? "✓ Available" : "❌ Missing (REQUIRED)");
+    printf("select: %s\n", select ? "✓ Available" : "❌ Missing (REQUIRED)");
+    printf("mix: %s\n", mix ? "✓ Available" : "❌ Missing (REQUIRED)");
     printf("setpts: %s\n", setpts ? "✓ Available" : "❌ Missing");
     printf("fps: %s\n", fps_filter ? "✓ Available" : "❌ Missing");
     printf("vidstabdetect: %s\n", vidstabdetect ? "✓ Available" : "❌ Missing");
     printf("vidstabtransform: %s\n", vidstabtransform ? "✓ Available" : "❌ Missing");
 
-    if (!tmix) {
-        printf("\n⚠️  ERROR: tmix filter not available!\n");
-        printf("   This is required for efficient motion blur.\n");
+    if (!split || !select || !mix) {
+        printf("\n⚠️  ERROR: Required filters for parallel stream processing not available!\n");
+        printf("   This approach requires split, select, and mix filters.\n");
         printf("   Please update FFmpeg to a recent version.\n");
     }
 
@@ -1180,9 +1240,12 @@ int main(int argc, char **argv) {
     if (argc < 2) {
         printf("RoadLapse - Speed up and stabilize your journey videos\n\n");
         printf("Usage:\n");
-        printf("  Single input:    %s output.mp4 input.mp4\n", argv[0]);
-        printf("  Multiple inputs: %s output.mp4 input1.mp4 input2.mp4 [...]\n", argv[0]);
+        printf("  Single input:    %s [--degree N] output.mp4 input.mp4\n", argv[0]);
+        printf("  Multiple inputs: %s [--degree N] output.mp4 input1.mp4 input2.mp4 [...]\n", argv[0]);
         printf("  Diagnostics:     %s --diagnose input.mp4\n", argv[0]);
+        printf("\nOptions:\n");
+        printf("  --degree N       Speedup degree (default: 2, meaning 4x speedup)\n");
+        printf("                   degree=1 → 2x, degree=2 → 4x, degree=3 → 8x, etc.\n");
         printf("\nFramerate is automatically optimized: 25fps→50fps, 30fps→60fps\n");
         return 1;
     }
@@ -1196,18 +1259,33 @@ int main(int argc, char **argv) {
         return diagnose_video_file(argv[2]) == 0 ? 0 : 1;
     }
 
-    // Need at least output and one input
-    if (argc < 3) {
+    // Parse speedup degree option
+    int speedup_degree = 2;  // Default to 4x speedup (2^2)
+    int arg_offset = 1;
+
+    if (argc > 3 && strcmp(argv[1], "--degree") == 0) {
+        speedup_degree = atoi(argv[2]);
+        if (speedup_degree < 1 || speedup_degree > 10) {
+            fprintf(stderr, "Error: Speedup degree must be between 1 and 10\n");
+            return 1;
+        }
+        arg_offset = 3;
+    }
+
+    // Need at least output and one input after processing options
+    if (argc < arg_offset + 2) {
         printf("Error: Need at least an output file and one input file\n");
-        printf("Usage: %s output.mp4 input1.mp4 [input2.mp4 ...]\n", argv[0]);
+        printf("Usage: %s [--degree N] output.mp4 input1.mp4 [input2.mp4 ...]\n", argv[0]);
         return 1;
     }
 
-    const char *output_file = argv[1];
-    int num_inputs = argc - 2;  // Total args minus program name and output file
-    char **input_files = &argv[2];
+    const char *output_file = argv[arg_offset];
+    int num_inputs = argc - arg_offset - 1;  // Remaining args after output file
+    char **input_files = &argv[arg_offset + 1];
+    int factor = 1 << speedup_degree;  // 2^speedup_degree
 
     printf("RoadLapse Processing Configuration:\n");
+    printf("Speedup degree: %d (factor: %dx)\n", speedup_degree, factor);
     printf("Output: %s\n", output_file);
     printf("Input files (%d):\n", num_inputs);
     for (int i = 0; i < num_inputs; i++) {
@@ -1231,11 +1309,12 @@ int main(int argc, char **argv) {
     }
 
     // Process all files
-    int result = process_roadlapse(input_files, num_inputs, output_file, on_progress, NULL);
+    int result = process_roadlapse(input_files, num_inputs, output_file, speedup_degree, on_progress, NULL);
 
     if (result == 0) {
         printf("\n🎉 RoadLapse processing completed successfully!\n");
         printf("Output saved to: %s\n", output_file);
+        printf("Effective speedup: %dx with motion blur\n", factor);
     } else {
         printf("\n❌ RoadLapse processing failed with error code: %d\n", result);
     }
